@@ -53,6 +53,68 @@ def fmt_tok(n) -> str:
     return ("%.1fk" % (n / 1000.0)) if n >= 10000 else str(int(n))
 
 
+# ── GPU 显存 ──────────────────────────────────────────────
+_GPU_CACHE = {"at": 0.0, "data": None}
+_GPU_CMD = None
+
+
+def _find_nvidia_smi():
+    """找 nvidia-smi。Windows 下一般在 System32，但 PATH 里未必有。"""
+    global _GPU_CMD
+    if _GPU_CMD is not None:
+        return _GPU_CMD or None
+    cands = []
+    if IS_WIN:
+        cands.append(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                  "System32", "nvidia-smi.exe"))
+    cands.append("nvidia-smi")
+    for c in cands:
+        try:
+            if c != "nvidia-smi" and not os.path.isfile(c):
+                continue
+            r = subprocess.run([c, "--query-gpu=name,memory.total,memory.used",
+                                "--format=csv,noheader,nounits"],
+                               capture_output=True, timeout=4,
+                               creationflags=_no_window_flag())
+            if r.returncode == 0 and r.stdout.strip():
+                _GPU_CMD = c
+                return c
+        except Exception:
+            continue
+    _GPU_CMD = ""
+    return None
+
+
+def gpu_mem(refresh=5.0):
+    """当前 GPU 显存 (已用, 总量, 名字)，单位字节。
+
+    每次调用要起一个进程（~90ms），所以缓存几秒。查不到返回 None。
+    """
+    t = now()
+    if _GPU_CACHE["data"] is not None and t - _GPU_CACHE["at"] < refresh:
+        return _GPU_CACHE["data"]
+    cmd = _find_nvidia_smi()
+    data = None
+    if cmd:
+        try:
+            r = subprocess.run([cmd, "--query-gpu=name,memory.total,memory.used",
+                                "--format=csv,noheader,nounits"],
+                               capture_output=True, timeout=4,
+                               creationflags=_no_window_flag())
+            line = (r.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+            if line:
+                parts = [p.strip() for p in line[0].split(",")]
+                if len(parts) >= 3:
+                    data = {"name": parts[0],
+                            "total": int(float(parts[1])) * 1024 * 1024,
+                            "used": int(float(parts[2])) * 1024 * 1024}
+        except Exception:
+            data = None
+    _GPU_CACHE["at"] = t
+    _GPU_CACHE["data"] = data
+    return data
+
+
 def fmt_dur(sec) -> str:
     sec = max(0.0, float(sec or 0))
     if sec < 60:
@@ -816,6 +878,7 @@ DEFAULTS = {
         "ubatch": 512,
         "parallel": 1,
         "flash_attn": True,
+        "kv_offload": True,
         "metrics": True,
         "extra_args": "",
     },
@@ -1438,17 +1501,20 @@ def scan_llama_services(cfg=None, log=None):
     ports = listening_ports()
     hits = []
     seen = set()
+    _lk = threading.Lock()
 
-    def _try(port, pid=None):
-        if port in seen:
+    def _try(port, pid=None, timeout=1.0):
+        with _lk:
+            if port in seen:
+                return
+            seen.add(port)
+        if not port_open(port, timeout=min(0.12, timeout)):
             return
-        seen.add(port)
-        if not port_open(port):
-            return
-        ok, info = probe_http("http://127.0.0.1:%d" % port)
+        ok, info = probe_http("http://127.0.0.1:%d" % port, timeout=timeout)
         if ok:
-            hits.append({"port": port, "pid": pid, "url": "http://127.0.0.1:%d" % port,
-                         "model": info.get("model", "")})
+            with _lk:
+                hits.append({"port": port, "pid": pid, "url": "http://127.0.0.1:%d" % port,
+                             "model": info.get("model", "")})
 
     # 1) 配置里写的服务
     for s in (cfg or {}).get("services") or []:
@@ -1467,13 +1533,40 @@ def scan_llama_services(cfg=None, log=None):
             for port, pid in ports.items():
                 if pid == p.get("pid"):
                     _try(port, pid)
-    # 3) 直接探常见端口
-    for port in PROBE_PORTS:
-        _try(port)
-    if log and hits:
-        log.add("发现 %d 个 llama 服务: %s" % (
-            len(hits), ", ".join(str(h["port"]) for h in hits)), "find", "ok")
+    # 3) 常见端口 + 所有其他监听端口，并行探。
+    #    只探 listening_ports 里的：不在里面的根本连不上，逐个 port_open
+    #    得白扔十几秒。所有端口一起探，几百毫秒就能出结果，
+    #    这样非标准端口（比如上次 TUI 用了 11234）重新启动后也能被找到。
+    cand = set(PROBE_PORTS)
+    if ports:
+        for port in ports:
+            if port < 1024:            # 系统端口不可能是 llama-server
+                continue
+            cand.add(port)
+    todo = [p for p in cand if p not in seen]
+    if todo:
+        import concurrent.futures
+        pids = dict(ports)
+        # 试探性的端口用短超时：139(NetBIOS) 这类会 accept 但不吭声，
+        # 1 秒超时白等。已知在配置里的那几个才值得给足时间。
+        sure = set()
+        for s in (cfg or {}).get("services") or []:
+            m = re.search(r":(\d+)", s.get("base_url", ""))
+            if m:
+                sure.add(int(m.group(1)))
+        sure.add(int((cfg or {}).get("run", {}).get("port") or 0))
+
+        def _one(p):
+            _try(p, pids.get(p), 1.5 if p in sure else 0.35)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(24, len(todo))) as ex:
+            list(ex.map(_one, todo))
     return hits
+
+
+def _service_fingerprint(hits):
+    """服务集合的指纹，用来判断「这次和上次一样不一样」。"""
+    return tuple(sorted((h.get("port"), h.get("pid")) for h in hits))
 
 
 def _is_llama_cmd(cmd, exe=""):
@@ -1482,12 +1575,22 @@ def _is_llama_cmd(cmd, exe=""):
             or "llama-bench" in blob or "llama.cpp" in blob)
 
 
-def list_processes():
+_PROC_CACHE = {"at": 0.0, "data": None}
+
+
+def list_processes(refresh=3.0):
+    """进程列表。查询一次要 0.7 秒，缓存几秒，别每次重扫都去问一遍。"""
+    t = now()
+    if _PROC_CACHE["data"] is not None and t - _PROC_CACHE["at"] < refresh:
+        return _PROC_CACHE["data"]
     if not IS_WIN:
-        return _list_procs_posix()
-    out = _procs_wmi()
-    if not out:
-        out = _procs_getprocess()
+        out = _list_procs_posix()
+    else:
+        out = _procs_wmi()
+        if not out:
+            out = _procs_getprocess()
+    _PROC_CACHE["at"] = t
+    _PROC_CACHE["data"] = out
     return out
 
 
@@ -1624,29 +1727,37 @@ def http_json(url, timeout=1.2):
 
 
 def probe_http(base_url, timeout=1.0):
-    """判断某地址是不是 llama.cpp：返回 (是否线上, {model, health})。"""
+    """判断某地址是不是 llama.cpp：返回 (是否线上, {model, health})。
+
+    只认 llama.cpp 独有的 /props（含 default_generation_settings 或
+    model_path 之类字段）。不然本机上随便哪个 HTTP 服务（QQ、代理、
+    开发服务器）都会被当成 llama-server。
+    """
     info = {"model": "", "health": "?"}
+    props = None
     try:
-        st, body = http_get(base_url + "/health", timeout=timeout)
-        if st in (200, 503):
-            info["health"] = "ok" if st == 200 else "loading"
+        st, props = http_json(base_url + "/props", timeout=timeout)
+    except Exception:
+        props = None
+    is_llama = (isinstance(props, dict)
+                and ("default_generation_settings" in props
+                     or "model_path" in props
+                     or "total_slots" in props))
+    if not is_llama:
+        return False, info
+    info["props"] = props
+    info["model"] = short_name(props.get("model_path"), props.get("model_alias"))
+    # /health 决定是「加载中」还是「就绪」
+    try:
+        st, _ = http_get(base_url + "/health", timeout=timeout)
+        if st == 200:
+            info["health"] = "ok"
+        elif st == 503:
+            info["health"] = "loading"
         else:
             info["health"] = "http%d" % st
     except Exception:
-        try:
-            st, _ = http_get(base_url + "/v1/models", timeout=timeout)
-            if st != 200:
-                return False, info
-            info["health"] = "ok"
-        except Exception:
-            return False, info
-    try:
-        st, props = http_json(base_url + "/props", timeout=timeout)
-        if st == 200 and isinstance(props, dict):
-            info["model"] = short_name(props.get("model_path"), props.get("model_alias"))
-            info["props"] = props
-    except Exception:
-        pass
+        info["health"] = "ok"          # /props 有响应就够说明活着
     return True, info
 
 
@@ -1914,6 +2025,10 @@ class Server(object):
             argv += ["-t", str(th)]
         if o.get("flash_attn", True):
             argv += ["-fa", "on"]
+        # KV 缓存放到 GPU。llama.cpp 默认是开的，这里显式写出来，
+        # 关掉时用 --no-kv-offload，省下来的显存可以多放几层权重。
+        if not o.get("kv_offload", True):
+            argv += ["--no-kv-offload"]
         if o.get("metrics", True):
             argv += ["--metrics"]
         extra = str(o.get("extra_args") or "").strip()
@@ -2017,7 +2132,7 @@ class Server(object):
             if IS_WIN:
                 # Popen 起的是子进程本体，但保险起见杀进程树
                 subprocess.run("taskkill /F /T /PID %d" % self.proc.pid,
-                               shell=True, capture_output=True, timeout=8,
+                               shell=True, capture_output=True, timeout=4,
                                creationflags=0x08000000)
             else:
                 self.proc.terminate()
@@ -2025,11 +2140,11 @@ class Server(object):
         except Exception as e:
             self.log.add("停止失败：%s" % e, "server", "err")
         try:
-            self.proc.wait(timeout=8)
+            self.proc.wait(timeout=4)
         except Exception:
             try:
                 self.proc.kill()
-                self.proc.wait(timeout=4)
+                self.proc.wait(timeout=2)
             except Exception:
                 pass
         self.state = "已停止"
@@ -2228,6 +2343,8 @@ class LlamaTUI(object):
         self.dirty = True
         self._lock = threading.Lock()
         self.scanning = False
+        self._probing = False           # 后台探测进行中
+        self._scanning_services = False  # 后台服务重扫进行中
         self.scan_status = ""
 
     # ── 生命周期 ──
@@ -2345,10 +2462,25 @@ class LlamaTUI(object):
         return models
 
     def rebuild_backends(self):
+        """重扫正在跑的服务。
+
+        只在结果真有变化才写日志——tick 每 20 秒扫一次，
+        每次都记一条「发现 1 个 llama 服务」会把日志刷满。
+        """
         old = dict((b.base_url or "pid:%s" % b.pid, b) for b in self.backends)
+        hits = scan_llama_services(self.cfg, None)
+        prev_fp = getattr(self, "_svc_fp", None)
+        fp = _service_fingerprint(hits)
+        changed = (fp != prev_fp)
+        self._svc_fp = fp
+        if changed and hits:
+            self.log.add("发现 %d 个 llama 服务: %s" % (
+                len(hits), ", ".join(str(h["port"]) for h in hits)), "find", "ok")
+        elif changed and prev_fp:
+            self.log.add("llama 服务已消失", "find", "warn")
         out = []
         seen = set()
-        for hit in scan_llama_services(self.cfg, self.log):
+        for hit in hits:
             key = hit["url"]
             if key in seen:
                 continue
@@ -2391,22 +2523,43 @@ class LlamaTUI(object):
     def tick(self):
         self.tick_n += 1
         if not self.demo:
-            probeable = [b for b in self.backends if b.base_url]
-            for b in probeable:
-                try:
-                    probe_backend(b)
-                except Exception as e:
-                    b.last_error = str(e)[:80]
+            # 探测放到后台：一个卡住的端口能让 probe_backend 拖 2.5 秒，
+            # 在主线程里做就是整屏僵死。这里发一次就不再发，等它自己回来。
+            if not self._probing:
+                probeable = [b for b in self.backends if b.base_url]
+                if probeable:
+                    self._probing = True
+                    threading.Thread(target=self._probe_all,
+                                     args=(probeable,), daemon=True).start()
             if now() - self.last_scan > float(self.cfg.get("scan_interval", 20.0)):
-                self.last_scan = now()
-                try:
-                    self.rebuild_backends()
-                except Exception:
-                    pass
+                if not self._scanning_services:
+                    self.last_scan = now()
+                    self._scanning_services = True
+                    threading.Thread(target=self._rebuild_async, daemon=True).start()
         self.refresh_model_live()
         self.last_probe = now()
         self.dirty = False
         self.prune_log_scroll()
+
+    def _probe_all(self, targets):
+        try:
+            for b in targets:
+                try:
+                    probe_backend(b)
+                except Exception as e:
+                    b.last_error = str(e)[:80]
+            self.dirty = True
+        finally:
+            self._probing = False
+
+    def _rebuild_async(self):
+        try:
+            self.rebuild_backends()
+            self.dirty = True
+        except Exception:
+            pass
+        finally:
+            self._scanning_services = False
 
     def refresh_model_live(self):
         if not self.models:
@@ -2608,6 +2761,7 @@ class LlamaTUI(object):
         ("ubatch", "ubatch (-ub)", int, 1, 8192),
         ("parallel", "并发槽 (-np)", int, 1, 64),
         ("flash_attn", "FlashAttn", bool, None, None),
+        ("kv_offload", "KV 缓存进 GPU", bool, None, None),
         ("metrics", "开 metrics", bool, None, None),
         ("extra_args", "额外参数", str, None, None),
     ]
@@ -2737,10 +2891,43 @@ class LlamaTUI(object):
             return
         # 停掉同端口的旧实例，避免抢占
         port = int(run.get("port") or 8080)
-        for s in self.servers:
-            if s.port == port and s.alive():
-                self.log.add("端口 %d 已有实例，先停掉" % port, "server", "warn")
-                s.stop()
+        stale = [s for s in self.servers if s.port == port and s.alive()]
+        if stale:
+            self.log.add("端口 %d 已有实例，先停掉" % port, "server", "warn")
+            self._stop_async(stale, on_done=lambda: self._launch_server(m, run, bin_path))
+            self.modal = None
+            self.form_edit = None
+            self.dirty = True
+            return
+        self._launch_server(m, run, bin_path)
+
+    def _stop_async(self, servers, on_done=None):
+        """后台停止进程。
+
+        taskkill + wait 在 Windows 上能拖到 8 秒以上，直接在主线程里做
+        会让整个界面僵住（按什么都没反应）。放到线程里，停完再回调。
+        """
+        def work():
+            for s in servers:
+                try:
+                    s.stop()
+                except Exception as e:
+                    self.log.add("停止失败：%s" % e, "server", "err")
+            self.dirty = True
+            if on_done:
+                try:
+                    on_done()
+                except Exception as e:
+                    self.log.add("启动后续失败：%s" % e, "server", "err")
+            self.dirty = True
+        self.flash("正在停掉旧实例…", 4)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _launch_server(self, m, run, bin_path):
+        """真正把 llama-server 拉起来（可能在后台线程里被调用）。"""
+        if not m or not bin_path:
+            self.flash("启动失败：模型或 llama-server 丢失")
+            return
         srv = Server(m.get("path"), run, bin_path, self.log)
         self.servers.insert(0, srv)
         self.modal = None
@@ -2808,11 +2995,9 @@ class LlamaTUI(object):
                 pass
             self.flash("没有由 TUI 启动的服务在跑")
             return
-        for s in alive:
-            s.stop()
-        self.log.add("已停止 %d 个服务" % len(alive), "server", "ok")
-        self.flash("已停止 %d 个服务" % len(alive))
-        self.dirty = True
+        self.log.add("正在停止 %d 个服务…" % len(alive), "server", "warn")
+        self._stop_async(alive, on_done=lambda: self.log.add(
+            "已停止 %d 个服务" % len(alive), "server", "ok"))
 
     # ── 鼠标 ──
     LEFT_BTN = 0x0001
@@ -3223,8 +3408,25 @@ class LlamaTUI(object):
             x += text_width("◆ %d 跑着" % nrun) + 2
         ls = self.llama_bin.get("llama-server")
         right = "llama.cpp: " + (os.path.basename(ls) if ls else "未找到")
+        # 显存：放在右边信息前面，显存吃紧时变色提醒
+        g = gpu_mem()
+        vram_s = ""
+        if g and g["total"]:
+            ratio = g["used"] / float(g["total"])
+            vram_s = "显存 %s/%s " % (fmt_bytes(g["used"]), fmt_bytes(g["total"]))
+            vcol = C["bad"] if ratio >= 0.92 else (C["warn"] if ratio >= 0.75 else C["dim"])
+        else:
+            vcol = C["ghost"]
         room = w - 2 - x
-        if text_width(right) <= room:
+        need = text_width(right) + (text_width(vram_s) if vram_s else 0)
+        if need <= room:
+            rx = w - 2 - text_width(right)
+            if vram_s:
+                vx = rx - text_width(vram_s)
+                if vx > x:
+                    cv.put(vx, 0, vram_s, vcol)
+            cv.put(rx, 0, right, C["ok"] if ls else C["ghost"])
+        elif text_width(right) <= room:
             cv.put(w - 2 - text_width(right), 0, right, C["ok"] if ls else C["ghost"])
 
     # ── 左：模型 ──
@@ -3704,13 +3906,29 @@ class LlamaTUI(object):
     def draw_run_form(self, cv):
         nfields = len(self.RUN_FIELDS)
         w = min(88, cv.w - 6)
-        # 标题1 + 模型1 + 空1 + 字段n + 空1 + 命令提示1 + 命令行最多2 + 提示1 + 边框2
-        h = min(nfields + 10, cv.h - 2)
+        # 标题1 + 模型1 + 大小/显存1 + 空1 + 字段n + 空1 + 命令提示1 + 命令行最多2 + 提示1 + 边框2
+        h = min(nfields + 11, cv.h - 2)
         x, y = (cv.w - w) // 2, (cv.h - h) // 2
         self._overlay(cv, x, y, w, h)
         cv.put(x + 2, y, " 运行 llama-server ", C["accent"])
         m = self.form_model or {}
         cv.putf(x + 2, y + 1, "模型: " + short_name(m.get("path") or "?"), w - 4, C["hi"])
+
+        # 模型大小 + 显存现状：一眼能看出放不放得下
+        try:
+            msize = os.path.getsize(m.get("path") or "") if m.get("path") else 0
+        except OSError:
+            msize = m.get("size") or 0
+        g = gpu_mem()
+        info = "大小 %s" % (fmt_bytes(msize) if msize else "-")
+        icol = C["dim"]
+        if g and g["total"]:
+            info += " · 显存 %s/%s" % (fmt_bytes(g["used"]), fmt_bytes(g["total"]))
+            # 模型比可用显存大很多就提醒一下
+            if msize and msize > g["total"]:
+                info += " · 超过总显存"
+                icol = C["warn"]
+        cv.putf(x + 2, y + 2, info, w - 4, icol)
 
         row = y + 3
         first_field = row

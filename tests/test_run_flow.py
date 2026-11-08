@@ -173,9 +173,19 @@ def main():
         e["m"] for e in tui.log.snapshot()), "见日志")
 
     print("== 7. 按 S 停止 ==")
+    # 停止走后台线程（界面不能僵住），所以这里等它落定
+    t0 = time.time()
     tui.handle_keys(["S"])
-    time.sleep(1.5)
+    check("按 S 立即返回", time.time() - t0 < 1.0, "%.2fs" % (time.time() - t0))
+    for _ in range(40):
+        if not srv.alive():
+            break
+        time.sleep(0.25)
     check("进程已停", not srv.alive(), srv.state)
+    for _ in range(20):
+        if not L.port_open(18091, timeout=0.3):
+            break
+        time.sleep(0.25)
     check("端口已释放", not L.port_open(18091, timeout=0.5))
 
     print("\n" + ("全部通过" if ok else "有失败项"))
