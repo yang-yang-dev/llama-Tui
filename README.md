@@ -4,7 +4,6 @@
 
 给 `llama-server` 用的终端界面，三栏显示模型、任务、日志。
 
-零依赖，只用 Python 标准库（3.8+），Windows / Linux / macOS 都可以。
 
 ![界面截图](docs/screenshot.png)
 
@@ -19,7 +18,6 @@
 llama_tui.py           主程序（单文件，全部逻辑都在这）
 demo_data.py           演示假数据，改它就能改 --demo 的内容
 config.example.json    配置模板，复制成 config.json 生效
-start.bat              Windows 双击启动
 tests/                 假服务 + 各类测试 + 截图脚本
 docs/                  README 用的截图
 .github/workflows/     CI：三个平台跑测试
@@ -60,7 +58,7 @@ Windows 下也可以到列表找到文件。
 
 ## 找到 llama.cpp 的方式
 
-按顺序尝试，命中即止：
+按顺序尝试：
 
 1. `PATH` 里的 `llama-server`
 2. `config.json` 里 `extra_llama_dirs` 指定的目录
