@@ -1,0 +1,53 @@
+{
+  "_说明": "把这个文件复制成 config.json 就会生效；也可以直接删掉，程序会自动发现。",
+
+  "refresh_interval": 2.0,
+  "max_logs": 5000,
+  "max_tokens": 0,
+  "temperature": 0.7,
+  "scan_processes": true,
+  "scan_interval": 20.0,
+
+  "_说明_目录": "自动全盘扫描之外的补充目录；两边斜杠都行，支持 C:/... 或 C:\\\\...",
+  "extra_llama_dirs": [
+    "D:\\llama.cpp\\build\\bin\\Release"
+  ],
+  "extra_model_dirs": [
+    "D:\\models",
+    "E:\\LLM"
+  ],
+
+  "_说明_服务": "扫描不到的远端服务可以写死在这里；本地 llama-server 一般不用填",
+  "services": [
+    {
+      "name": "远程 4090",
+      "base_url": "http://192.168.1.20:8080",
+      "api_key": ""
+    }
+  ],
+
+  "_说明_模型": "按 n 手动登记后会出现在这里；路径写 .gguf 的绝对路径",
+  "models": [],
+
+  "_说明_run": "在 TUI 里按 R 打开运行表单，改的就是这里；按 R 启动时用这套参数",
+  "run": {
+    "port": 8080,
+    "ctx": 4096,
+    "ngl": 99,
+    "threads": 0,
+    "batch": 512,
+    "ubatch": 512,
+    "parallel": 1,
+    "flash_attn": true,
+    "metrics": true,
+    "extra_args": ""
+  },
+
+  "_说明_spawn": "按 s 会用这里的命令拉起服务；{llama-server} 会自动替换成扫到的可执行文件路径。日常用 R 更省事，这段留给批量/固定场景。",
+  "spawn": [
+    {
+      "cmd": "{llama-server} -m D:\\models\\Qwen3-14B-Instruct-Q4_K_M.gguf -c 16384 -ngl 99 --port 8080 --metrics",
+      "cwd": "D:\\llama.cpp"
+    }
+  ]
+}
