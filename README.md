@@ -1,5 +1,7 @@
 # llama.cpp TUI
 
+## 由deepseek辅助编写
+
 给 `llama-server` 用的终端界面，三栏显示模型、任务、日志。
 
 零依赖，只用 Python 标准库（3.8+），Windows / Linux / macOS 都可以。
