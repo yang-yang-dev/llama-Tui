@@ -1,32 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-llama_tui.py —— llama.cpp 命令行小管家（零依赖单文件 TUI）
-
-    ┌ 模型 ──────────────────┬ 任务 ───────────────┬ 日志 ───────────────┐
-    │ ● Qwen3-14B-Q4_K_M     │ ◆#1 写个快排        │ 15:42:01 [server] … │
-    │   运行中 · pid 41232   │   运行 233 tok …    │ 15:42:02 [task]   … │
-    │   127.0.0.1:8080       │ ✓#2 解释 KV cache   │ …                   │
-    │   ctx ████░░ 10k/16k   │ ⊘#3 失败            │                     │
-    └────────────────────────┴─────────────────────┴─────────────────────┘
-    f 发任务  v 详情  m 选模型  n 加模型  T 测速  l 过滤  r 重扫  ? 帮助  q 退出
-
-特点
-  * 零依赖：只用 Python 标准库，Windows/Linux/macOS 通用
-  * 自动发现 llama.cpp 可执行文件（PATH / 注册表 / 常见目录 / 全盘浅扫）
-  * 自动发现 .gguf 模型（缓存目录 / 常见文件夹 / 配置目录）
-  * 自动发现正在监听服务的 llama-server 进程（WMI → Get-Process → netstat → TCP 探测）
-  * 状态探测：/health /props /metrics /slots，外加一次 1-token 推理验证
-  * 发出的任务自己收流式输出并计时，tok/s 是实测值
-  * 中文宽字符按 2 列排版，不乱
-
-用法
-  python llama_tui.py                 # 自动发现后进入界面
-  python llama_tui.py --demo          # 假数据预览
-  python llama_tui.py --find          # 只打印发现了什么，不进界面
-  python llama_tui.py --selftest      # 自检
-  python llama_tui.py --dump-frame    # 打一帧界面（调试布局）
-"""
 
 from __future__ import annotations
 
@@ -859,10 +832,18 @@ def deep_merge(base, extra):
     return out
 
 
+def config_home():
+    """配置的落盘位置：跟程序放一起。
+
+    以前是「先看 cwd，再看程序目录」，结果在别处启动就另起一份配置，
+    现在固定到程序目录，谁也别想偷偷写别处。
+    """
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 def load_config(path=None):
-    here = os.path.dirname(os.path.abspath(__file__))
-    cands = [path] if path else [os.path.join(os.getcwd(), "config.json"),
-                                 os.path.join(here, "config.json")]
+    here = config_home()
+    cands = [path] if path else [os.path.join(here, "config.json")]
     cfg = json.loads(json.dumps(DEFAULTS))
     used = None
     for p in cands:
@@ -884,7 +865,7 @@ def load_config(path=None):
 
 
 def save_config(cfg):
-    path = cfg.get("_path") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    path = cfg.get("_path") or os.path.join(config_home(), "config.json")
     data = {k: v for k, v in cfg.items() if not k.startswith("_") and k != "site_dir"}
     tmp = path + ".tmp"
     try:
@@ -1984,8 +1965,16 @@ class Server(object):
         return True
 
     def _pump(self):
-        """持续读进程输出，转进日志；顺便识别「模型加载完成」。"""
-        ready = re.compile(r"(server is listening|starting the main loop|all slots are idle)", re.I)
+        """持续读进程输出，转进日志；顺便识别「模型加载完成」。
+
+        llama.cpp 的日志格式改过好几轮，这里宁可多认几种：
+        - 旧版: "server is listening on ..." / "all slots are idle"
+        - 新版: "srv  server_on_li: listening on http://..." / "server_run_i: model loaded"
+        """
+        ready = re.compile(
+            r"(server is listening|starting the main loop|all slots are idle"
+            r"|listening on https?://|model loaded)", re.I)
+        progress = re.compile(r"(loading model|llama_model_load|init: llama threadpool)", re.I)
         try:
             for raw in self.proc.stdout:
                 line = raw.decode("utf-8", "replace").rstrip()
@@ -2002,7 +1991,7 @@ class Server(object):
                 self.log.add(line, "server", kind)
                 if ready.search(line):
                     self.state = "运行中"
-                elif re.search(r"(loading model|llama_model_load)", line, re.I):
+                elif progress.search(line):
                     self.state = "启动中"
         except Exception as e:
             self.log.add("读进程输出出错：%s" % e, "server", "err")
@@ -3360,6 +3349,9 @@ class LlamaTUI(object):
             sub.append("运行中")
         if sub:
             out.append(("ghost", "     " + " · ".join(sub)))
+        # 文件没了就明说，别让人按了 R 才发现（演示模式的假路径不报）
+        if not self.demo and not os.path.isfile(m.get("path") or ""):
+            out.append(("warn", "     文件不在了，按 d 移除"))
         return out
 
     def draw_row(self, cv, x, y, w, kind, payload):
@@ -3376,6 +3368,8 @@ class LlamaTUI(object):
             cv.putf(x, y, payload, w, C["dim"])
         elif kind == "ghost":
             cv.putf(x, y, payload, w, C["ghost"])
+        elif kind == "warn":
+            cv.putf(x, y, payload, w, C["warn"])
         elif kind == "kv":
             k, v = payload
             cv.put(x, y, k + " ", C["dim"])

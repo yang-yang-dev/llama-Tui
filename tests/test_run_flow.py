@@ -90,6 +90,8 @@ def main():
     print("临时目录:", tmp)
 
     cfg = L.load_config(None)
+    # 关键：把落盘路径指到临时目录，绝不碰仓库里的 config.json
+    cfg["_path"] = os.path.join(tmp, "config.json")
     cfg["models"] = [{"name": "Tiny-Test-Q4_K_M.gguf", "path": model}]
     tui = L.LlamaTUI(cfg, backend=MemBackend(), demo=True)
     tui.llama_bin = {"llama-server": server_exe}
