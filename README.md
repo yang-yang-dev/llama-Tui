@@ -17,21 +17,21 @@
 ```
 llama_tui.py           主程序（单文件，全部逻辑都在这）
 demo_data.py           演示假数据，改它就能改 --demo 的内容
+start.bat              windows启动方式
 config.example.json    配置模板，复制成 config.json 生效
 tests/                 假服务 + 各类测试 + 截图脚本
 docs/                  README 用的截图
 .github/workflows/     CI：三个平台跑测试
 ```
 
-## 构建程序
+## 运行程序
 
 ```bash
 python llama_tui.py          # 启动界面
 python llama_tui.py --find   # 只看发现了什么，不进界面
 python llama_tui.py --demo   # 假数据，没装 llama.cpp 也能看效果
 ```
-
-Windows 下也可以到列表找到文件。
+windows也可以点bat文件
 
 > **如果双击时弹出「来自 Internet 的文件」安全警告**：这跟代码签名无关，也不是文件被标记了，而是注册表里的 `file:` 协议被映射到了 Internet 安全区域。多半是某个「系统优化」工具或安全软件改的。检查：
 >
